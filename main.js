@@ -17,7 +17,7 @@ var http = require('http');
 var dispatcher = new HttpDispatcher();
 
 function getCurrentDateTime() {
-  return moment().format('YYYY-MM-DDTHHmmss'); // The only true way of writing out dates and times, ISO 8601
+  return moment().format('YYYY-MM-DD_HH-mm-ss'); // The only true way of writing out dates and times, ISO 8601
 };
 
 function printMsg(msg) {
@@ -254,7 +254,7 @@ function selectMyModels() {
       if (dirty) {
         printDebugMsg('Save changes in config.yml');
 
-        fs.writeFileSync('config.yml', yaml.safeDump(config), 0, 'utf8');
+        fs.writeFileSync('config.yml', yaml.safeDump(config), 'utf8');
 
         dirty = false;
       }
@@ -275,7 +275,7 @@ function createCaptureProcess(model) {
 
   return Promise
     .try(function() {
-      var filename = model.nm + '-' + getCurrentDateTime() + '.ts';
+      var filename = model.nm + '_' + getCurrentDateTime() + '.ts';
 
       var spawnArguments = [
         '-hide_banner',
@@ -325,7 +325,14 @@ function createCaptureProcess(model) {
               // do nothing, shit happens
             });
           } else {
-            mv(config.captureDirectory + '/' + filename, config.completeDirectory + '/' + filename, function(err) {
+            //ADD DIR FOR MODEL
+            var modelDir = config.completeDirectory + '/' + model.uid + ' - ' + model.nm;
+            mkdirp(modelDir, function(err) {
+              if (err) {
+                printErrorMsg(err);
+              }
+            });
+            mv(config.captureDirectory + '/' + filename, modelDir + '/' + filename, function(err) {
               if (err) {
                 printErrorMsg('[' + colors.green(model.nm) + '] ' + err.toString());
               }
