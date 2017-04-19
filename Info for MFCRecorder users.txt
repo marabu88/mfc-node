@@ -1,0 +1,18 @@
+Info for MFCRecorder users
+===========
+
+How export your model-list. 
+
+Copy from Settings.xml part <ModelsInclude>...</ModelsInclude> to config.yml like this:
+
+includeUids:
+    <long>16780615</long>
+    <long>19545438</long>
+    <long>66066111</long>
+
+And replace with any text editor "<long>" => "- " and "</long>" => "" (without quiotes) like this:
+
+includeUids:
+    - 16780615
+    - 19545438
+    - 66066111
