@@ -1,693 +1,529 @@
 'use strict';
-var Promise = require('bluebird');
-var fs = Promise.promisifyAll(require('fs'));
-var mv = require('mv');
-var yaml = require('js-yaml');
-var moment = require('moment');
-var mkdirp = require('mkdirp');
-var S = require('string');
-var WebSocketClient = require('websocket').client;
-var bhttp = require('bhttp');
-var colors = require('colors');
-var _ = require('underscore');
+require('events').EventEmitter.prototype._maxListeners = 100;
+
+// Load 3rd Party Libraries
+var Promise      = require('bluebird');
+var fs           = require('fs');
+var mv           = require('mv');
+var yaml         = require('js-yaml');
+var mkdirp       = require('mkdirp');
+var colors       = require('colors/safe');
+var _            = require('underscore');
 var childProcess = require('child_process');
-var path = require('path');
-var HttpDispatcher = require('httpdispatcher');
-var http = require('http');
-var dispatcher = new HttpDispatcher();
+var path         = require('path');
 
-function getCurrentDateTime() {
-  return moment().format('YYYY-MM-DD_HH-mm-ss'); // The only true way of writing out dates and times, ISO 8601
-};
+// Load local libraries
+var common       = require('./common');
+var MFC          = require('./mfc');
+var CB           = require('./cb');
 
-function printMsg(msg) {
-  console.log(colors.blue('[' + getCurrentDateTime() + ']'), msg);
+var SITES        = [MFC, CB];
+var semaphore    = 0; // Counting semaphore
+var tryingToExit = 0;
+var config       = yaml.safeLoad(fs.readFileSync('config.yml', 'utf8'));
+
+config.captureDirectory  = path.resolve(config.captureDirectory);
+config.completeDirectory = path.resolve(config.completeDirectory);
+
+common.setSites(MFC, CB);
+common.initColors();
+
+// time in milliseconds
+function sleep(time) {
+  return new Promise((resolve) => setTimeout(resolve, time));
 }
 
-function printErrorMsg(msg) {
-  console.log(colors.blue('[' + getCurrentDateTime() + ']'), colors.red('[ERROR]'), msg);
-}
-
-function printDebugMsg(msg) {
-  if (config.debug && msg) {
-    console.log(colors.blue('[' + getCurrentDateTime() + ']'), colors.yellow('[DEBUG]'), msg);
+// Processes updates.yml and adds or removes models from config.yml
+function processUpdates(site) {
+  var len;
+  switch (site) {
+    case MFC: len = config.mfcmodels.length; break;
+    case CB:  len = config.cbmodels.length;  break;
   }
-}
+  common.dbgMsg(site, len + ' model(s) in config');
 
-function getTimestamp() {
-  return Math.floor(new Date().getTime() / 1000);
-}
+  var stats = fs.statSync('updates.yml');
 
-function dumpModelsCurrentlyCapturing() {
-  _.each(modelsCurrentlyCapturing, function(m) {
-    printDebugMsg(colors.red(m.pid) + '\t' + m.checkAfter + '\t' + m.filename + '\t' + m.size + ' bytes');
-  });
-}
+  var includeModels = [];
+  var excludeModels = [];
 
-function getUid(nm) {
-  var onlineModel = _.findWhere(onlineModels, {nm: nm});
+  if (stats.isFile()) {
+    var updates = yaml.safeLoad(fs.readFileSync('updates.yml', 'utf8'));
 
-  return _.isUndefined(onlineModel) ? false : onlineModel.uid;
-}
+    switch (site) {
+      case MFC:
+        if (!updates.includeMfcModels) {
+          updates.includeMfcModels = [];
+        } else if (updates.includeMfcModels.length > 0) {
+          common.msg(site, updates.includeMfcModels.length + ' model(s) to include');
+          includeModels = updates.includeMfcModels;
+          updates.includeMfcModels = [];
+        }
 
-function remove(value, array) {
-  var idx = array.indexOf(value);
+        if (!updates.excludeMfcModels) {
+          updates.excludeMfcModels = [];
+        } else if (updates.excludeMfcModels.length > 0) {
+          common.msg(site, updates.excludeMfcModels.length + ' model(s) to exclude');
+          excludeModels = updates.excludeMfcModels;
+          updates.excludeMfcModels = [];
+        }
+        break;
 
-  if (idx != -1) {
-    array.splice(idx, 1);
+      case CB:
+        if (!updates.includeCbModels) {
+          updates.includeCbModels = [];
+        } else if (updates.includeCbModels.length > 0) {
+          common.msg(CB, updates.includeCbModels.length + ' model(s) to include');
+          includeModels = updates.includeCbModels;
+          updates.includeCbModels = [];
+        }
+
+        if (!updates.excludeCbModels) {
+          updates.excludeCbModels = [];
+        } else if (updates.excludeCbModels.length > 0) {
+          common.msg(site, updates.excludeCbModels.length + ' model(s) to exclude');
+          excludeModels = updates.excludeCbModels;
+          updates.excludeCbModels = [];
+        }
+        break;
+    }
+
+    // if there were some updates, then rewrite updates.yml
+    if (includeModels.length > 0 || excludeModels.length > 0) {
+      fs.writeFileSync('updates.yml', yaml.safeDump(updates), 'utf8');
+    }
   }
+
+  var bundle = {includeModels: includeModels, excludeModels: excludeModels, dirty: false};
+  return bundle;
 }
 
-// returns true, if the mode has been changed
-function setMode(uid, mode) {
-  var configModel = _.findWhere(config.models, {uid: uid});
+function addModel(site, model) {
+  var index;
+  var nm;
 
-  if (_.isUndefined(configModel)) {
-    config.models.push({uid: uid, mode: mode});
+  switch (site) {
+    case MFC: index = config.mfcmodels.indexOf(model.uid); nm = model.nm; break;
+    case CB:  index = config.cbmodels.indexOf(model);      nm = model;    break;
+  }
+
+  if (index === -1) {
+    common.msg(site, colors.model(nm) + colors.italic(' added') + ' to capture list');
+
+    switch (site) {
+      case MFC: config.mfcmodels.push(model.uid); break;
+      case CB:  config.cbmodels.push(nm);         break;
+    }
 
     return true;
-  } else if (configModel.mode != mode) {
-    configModel.mode = mode;
-
-    return true;
+  } else {
+    common.msg(site, colors.model(nm) + ' is already in the capture list');
   }
 
   return false;
 }
 
-function getFileno() {
-  return new Promise(function(resolve, reject) {
-    var client = new WebSocketClient();
+function addModels(site, bundle) {
+  var i;
 
-    client.on('connectFailed', function(err) {
-      reject(err);
-    });
-
-    client.on('connect', function(connection) {
-
-      connection.on('error', function(err) {
-        reject(err);
-      });
-
-      connection.on('message', function(message) {
-        if (message.type === 'utf8') {
-          var parts = /%22opts%22:([0-9_]*),%22respkey%22:([0-9_]*),%22serv%22:([0-9_]*),%22type%22:([0-9_]*)\}/.exec(message.utf8Data);
-
-          if (parts && parts[1] && parts[2] && parts[3] && parts[4]) {
-            var a = `respkey=${parts[2]}&type=${parts[4]}&opts=${parts[1]}&serv=${parts[3]}&`;
-            printDebugMsg(a);
-
-            connection.close();
-            resolve(a);
+  switch (site) {
+    case MFC:
+      // Fetch the UID of new models to add to capture list.
+      // The model does not have to be online for this.
+      var queries = [];
+      for (i = 0; i < bundle.includeModels.length; i++) {
+        var query = MFC.queryUser(bundle.includeModels[i]).then((model) => {
+          if (typeof model !== 'undefined') {
+            bundle.dirty |= addModel(site, model);
           }
-        }
-      });
-
-      connection.sendUTF("hello fcserver\n\0");
-      connection.sendUTF("1 0 0 20071025 0 guest:guest\n\0");
-    });
-
-    client.connect('ws://xchat20.myfreecams.com:8080/fcsl', '', 'http://xchat20.myfreecams.com:8080', {Cookie: 'company_id=3149; guest_welcome=1; history=7411522,5375294'});
-  }).timeout(30000); // 30 secs
-}
-
-function getOnlineModels(fileno) {
-  var url = 'http://www.myfreecams.com/php/FcwExtResp.php?' + fileno;
-
-  printDebugMsg(url);
-
-  return Promise
-    .try(function() {
-      return session.get(url);
-    })
-    .then(function(response) {
-      onlineModels = [];
-
-      try {
-        var data = JSON.parse(response.body.toString('utf8'));
-        var m;
-
-        for (var i = 1; i < data.rdata.length; i += 1) {
-          m = data.rdata[i];
-
-          onlineModels.push({
-            m: {
-              camscore: m[14],
-              missmfc: 0,
-              new_model: m[17],
-              rc: m[19]
-            },
-            nm: m[0],
-            u: {
-              age: '',
-              camserv: m[6],
-              city: '',
-              country: ''
-            },
-            uid: m[2],
-            vs: m[3]
-          });
-        }
-      } catch (err) {
-        throw new Error('Failed to parse data');
-      }
-
-      printMsg(onlineModels.length  + ' model(s) online');
-    })
-    .timeout(30000); // 30 secs
-}
-
-function selectMyModels() {
-  return Promise
-    .try(function() {
-      printDebugMsg(config.models.length + ' model(s) in config');
-
-      // to include the model only knowing her name, we need to know her uid,
-      // if we could not find model's uid in array of online models we skip this model till the next iteration
-      config.includeModels = _.filter(config.includeModels, function(nm) {
-        var uid = getUid(nm);
-
-        if (uid === false) {
-          return true; // keep the model till the next iteration
-        }
-
-        config.includeUids.push(uid);
-        dirty = true;
-      });
-
-      config.excludeModels = _.filter(config.excludeModels, function(nm) {
-        var uid = getUid(nm);
-
-        if (uid === false) {
-          return true; // keep the model till the next iteration
-        }
-
-        config.excludeUids.push(uid);
-        dirty = true;
-      });
-
-      config.deleteModels = _.filter(config.deleteModels, function(nm) {
-        var uid = getUid(nm);
-
-        if (uid === false) {
-          return true; // keep the model till the next iteration
-        }
-
-        config.deleteUids.push(uid);
-        dirty = true;
-      });
-
-      _.each(config.includeUids, function(uid) {
-        dirty = setMode(uid, 1) || dirty;
-      });
-
-      config.includeUids = [];
-
-      _.each(config.excludeUids, function(uid) {
-        dirty = setMode(uid, 0) || dirty;
-      });
-
-      config.excludeUids = [];
-
-      _.each(config.deleteUids, function(uid) {
-        dirty = setMode(uid, -1) || dirty;
-      });
-
-      config.deleteUids = [];
-
-      // remove duplicates
-      if (dirty) {
-        config.models = _.uniq(config.models, function(m) {
-          return m.uid;
         });
+        queries.push(query);
       }
 
-      var myModels = [];
-
-      _.each(config.models, function(configModel) {
-        var onlineModel = _.findWhere(onlineModels, {uid: configModel.uid});
-
-        if (!_.isUndefined(onlineModel)) {
-          // if the model does not have a name in config.models we use her name by default
-          if (!configModel.nm) {
-            configModel.nm = onlineModel.nm;
-            dirty = true;
-          }
-
-          onlineModel.mode = configModel.mode;
-
-          if (onlineModel.mode == 1) {
-            if (onlineModel.vs === 0) {
-              myModels.push(onlineModel);
-            } else if (onlineModel.vs === 90) {
-              printDebugMsg(colors.green(onlineModel.nm) + ' has vs == 90');
-              myModels.push(onlineModel);
-            } else {
-              printMsg(colors.green(onlineModel.nm) + ' is away or in a private');
-            }
-          }
-        }
+      return Promise.all(queries).then(function() {
+        return bundle;
       });
 
-      printDebugMsg(myModels.length  + ' model(s) to capture');
-
-      if (dirty) {
-        printDebugMsg('Save changes in config.yml');
-
-        fs.writeFileSync('config.yml', yaml.safeDump(config), 'utf8');
-
-        dirty = false;
+    case CB:
+      for (i = 0; i < bundle.includeModels.length; i++) {
+        var nm = bundle.includeModels[i];
+        bundle.dirty |= addModel(site, nm);
       }
-
-      return myModels;
-    });
+      return bundle;
+  }
+  return;
 }
 
-function createCaptureProcess(model) {
-  var modelCurrentlyCapturing = _.findWhere(modelsCurrentlyCapturing, {uid: model.uid});
+function removeModel(site, model) {
+  var match;
+  var nm;
 
-  if (!_.isUndefined(modelCurrentlyCapturing)) {
-    printDebugMsg(colors.green(model.nm) + ' is already capturing');
-    return; // resolve immediately
+  switch (site) {
+    case MFC: match = model.uid; nm = model.nm; break;
+    case CB:  match = model;     nm = model;    break;
   }
 
-  printMsg(colors.green(model.nm) + ' is now online, starting capturing process');
+  common.msg(site, colors.model(nm) + colors.italic(' removed') + ' from capture list.');
+  site.haltCapture(match);
 
-  return Promise
-    .try(function() {
-      var filename = model.nm + '_' + getCurrentDateTime() + '.ts';
-
-      var spawnArguments = [
-        '-hide_banner',
-        '-v',
-        'fatal',
-        '-i',
-        'http://video' + (model.u.camserv - 500) + '.myfreecams.com:1935/NxServer/ngrp:mfc_' + (100000000 + model.uid) + '.f4v_mobile/playlist.m3u8?nc=1423603882490',
-        // 'http://video' + (model.u.camserv - 500) + '.myfreecams.com:1935/NxServer/mfc_' + (100000000 + model.uid) + '.f4v_aac/playlist.m3u8?nc=1423603882490',
-        '-c',
-        'copy',
-        config.captureDirectory + '/' + filename
-      ];
-
-      var captureProcess = childProcess.spawn('ffmpeg', spawnArguments);
-
-      captureProcess.stdout.on('data', function(data) {
-        printMsg(data.toString);
-      });
-
-      captureProcess.stderr.on('data', function(data) {
-        printMsg(data.toString);
-      });
-
-      captureProcess.on('close', function(code) {
-        printMsg(colors.green(model.nm) + ' stopped streaming');
-
-        var modelCurrentlyCapturing = _.findWhere(modelsCurrentlyCapturing, {pid: captureProcess.pid});
-
-        if (!_.isUndefined(modelCurrentlyCapturing)) {
-
-          var modelIndex = modelsCurrentlyCapturing.indexOf(modelCurrentlyCapturing);
-
-          if (modelIndex !== -1) {
-            modelsCurrentlyCapturing.splice(modelIndex, 1);
-          }
-        }
-
-        fs.stat(config.captureDirectory + '/' + filename, function(err, stats) {
-          if (err) {
-            if (err.code == 'ENOENT') {
-              // do nothing, file does not exists
-            } else {
-              printErrorMsg('[' + colors.green(model.nm) + '] ' + err.toString());
-            }
-          } else if (stats.size == 0 || stats.size < (config.minFileSizeMb * 1048576)) {
-            fs.unlink(config.captureDirectory + '/' + filename, function(err) {
-              // do nothing, shit happens
-            });
-          } else {
-            //ADD DIR FOR MODEL
-            var modelDir = config.completeDirectory + '/' + model.uid + ' - ' + model.nm;
-            mkdirp(modelDir, function(err) {
-              if (err) {
-                printErrorMsg(err);
-              }
-            });
-            mv(config.captureDirectory + '/' + filename, modelDir + '/' + filename, function(err) {
-              if (err) {
-                printErrorMsg('[' + colors.green(model.nm) + '] ' + err.toString());
-              }
-            });
-          }
-        });
-      });
-
-      if (!!captureProcess.pid) {
-        modelsCurrentlyCapturing.push({
-          nm: model.nm,
-          uid: model.uid,
-          filename: filename,
-          captureProcess: captureProcess,
-          pid: captureProcess.pid,
-          checkAfter: getTimestamp() + 600, // we are gonna check the process after 10 min
-          size: 0
-        });
-      }
-    })
-    .catch(function(err) {
-      printErrorMsg('[' + colors.green(model.nm) + '] ' + err.toString());
-    });
-}
-
-function checkCaptureProcess(model) {
-  var onlineModel = _.findWhere(onlineModels, {uid: model.uid});
-
-  if (!_.isUndefined(onlineModel)) {
-    if (onlineModel.mode == 1) {
-      onlineModel.capturing = true;
-    } else if (!!model.captureProcess) {
-      // if the model has been excluded or deleted we stop capturing process and resolve immediately
-      printDebugMsg(colors.green(model.nm) + ' has to be stopped');
-      model.captureProcess.kill();
-      return;
-    }
+  switch (site) {
+    case MFC: config.mfcmodels = _.without(config.mfcmodels, model.uid); break;
+    case CB:  config.cbmodels  = _.without(config.cbmodels,  model);     break;
   }
 
-  // if this is not the time to check the process then we resolve immediately
-  if (model.checkAfter > getTimestamp()) {
+  return true;
+}
+
+function removeModels(site, bundle) {
+  var i;
+  switch (site) {
+    case MFC:
+      // Fetch the UID of current models to be excluded from capture list.
+      // The model does not have to be online for this.
+      var queries = [];
+      for (i = 0; i < bundle.excludeModels.length; i++) {
+        var query = MFC.queryUser(bundle.excludeModels[i]).then((model) => {
+          if (typeof model !== 'undefined') {
+            bundle.dirty |= removeModel(site, model);
+          }
+        });
+        queries.push(query);
+      }
+
+      return Promise.all(queries).then(function() {
+        return bundle.dirty;
+      });
+
+    case CB:
+      for (i = 0; i < bundle.excludeModels.length; i++) {
+        var nm = bundle.excludeModels[i];
+        var index = config.cbmodels.indexOf(nm);
+        if (index !== -1) {
+          bundle.dirty |= removeModel(site, nm);
+        }
+      }
+      return bundle.dirty;
+  }
+  return;
+}
+
+function writeConfig(site, onlineModels, dirty) {
+  if (dirty) {
+    common.dbgMsg(site, 'Rewriting config.yml');
+    fs.writeFileSync('config.yml', yaml.safeDump(config), 'utf8');
+  }
+
+  var modelsToCap = [];
+  switch (site) {
+    case MFC:
+      MFC.clearMyModels();
+      return Promise.all(config.mfcmodels.map(MFC.checkModelState))
+      .then(function() {
+        return MFC.getModelsToCap();
+      })
+      .catch(function(err) {
+        common.errMsg(site, err.toString());
+      });
+
+    case CB:
+      _.each(config.cbmodels, function(nm) {
+        var modelIndex = onlineModels.indexOf(nm);
+        if (modelIndex !== -1) {
+          modelsToCap.push(nm);
+        }
+      });
+      return modelsToCap;
+  }
+}
+
+function getModelsToCap(site, onlineModels) {
+  if (onlineModels === null) {
+    return;
+  }
+  return Promise.try(function() {
+    return processUpdates(site);
+  })
+  .then(function(bundle) {
+    return addModels(site, bundle);
+  })
+  .then(function(bundle) {
+    return removeModels(site, bundle);
+  })
+  .then(function(dirty) {
+    return writeConfig(site, onlineModels, dirty);
+  })
+  .catch(function(err) {
+    common.errMsg(site, err);
+  });
+}
+
+function removeModelFromCapList(site, model) {
+  var index;
+
+  switch (site) {
+    case MFC: index = model.uid; break;
+    case CB:  index = model;     break;
+  }
+
+  site.removeModelFromCapList(index);
+}
+
+function postProcess(filename) {
+  if (config.autoConvertType !== 'mp4' && config.autoConvertType !== 'mkv') {
+    common.dbgMsg(null, 'Moving ' + config.captureDirectory + '/' + filename + '.ts to ' + config.completeDirectory + '/' + filename + '.ts');
+    mv(config.captureDirectory + '/' + filename + '.ts', config.completeDirectory + '/' + filename + '.ts', function(err) {
+      if (err) {
+        common.errMsg(null, colors.site(filename) + ': ' + err.toString());
+      }
+    });
     return;
   }
 
-  return fs
-    .statAsync(config.captureDirectory + '/' + model.filename)
-    .then(function(stats) {
-      // we check the process every 10 minutes since its start,
-      // if the size of the file has not changed for the last 10 min, we kill the process
-      if (stats.size - model.size > 0) {
-        printDebugMsg(colors.green(model.nm) + ' is alive');
+  var mySpawnArguments;
+  if (config.autoConvertType == 'mp4') {
+    mySpawnArguments = [
+      '-hide_banner',
+      '-v',
+      'fatal',
+      '-i',
+      config.captureDirectory + '/' + filename + '.ts',
+      '-c',
+      'copy',
+      '-bsf:a',
+      'aac_adtstoasc',
+      '-copyts',
+      config.completeDirectory + '/' + filename + '.' + config.autoConvertType
+    ];
+  } else if (config.autoConvertType == 'mkv') {
+    mySpawnArguments = [
+      '-hide_banner',
+      '-v',
+      'fatal',
+      '-i',
+      config.captureDirectory + '/' + filename + '.ts',
+      '-c',
+      'copy',
+      '-copyts',
+      config.completeDirectory + '/' + filename + '.' + config.autoConvertType
+    ];
+  }
 
-        model.checkAfter = getTimestamp() + 600; // 10 minutes
-        model.size = stats.size;
-      } else if (!!model.captureProcess) {
-        // we assume that onClose will do all clean up for us
-        printErrorMsg('[' + colors.green(model.nm) + '] Process is dead');
-        model.captureProcess.kill();
+  semaphore++;
+
+  if (tryingToExit) {
+    if (config.debug) {
+      process.stdout.write(colors.debug('[DEBUG]') + ' Converting ' + filename + '.ts to ' + filename + '.' + config.autoConvertType + '\n' + colors.time('[' + common.getDateTime() + '] '));
+    }
+  } else {
+    common.dbgMsg(null, 'Converting ' + filename + '.ts to ' + filename + '.' + config.autoConvertType);
+  }
+
+  var myCompleteProcess = childProcess.spawn('ffmpeg', mySpawnArguments);
+
+  myCompleteProcess.stdout.on('data', function(data) {
+    common.msg(null, data);
+  });
+
+  myCompleteProcess.stderr.on('data', function(data) {
+    common.msg(null, data);
+  });
+
+  myCompleteProcess.on('close', function() {
+    fs.unlink(config.captureDirectory + '/' + filename + '.ts');
+    // For debug, to keep disk from filling during active testing
+    if (config.autoDelete) {
+      if (tryingToExit) {
+        process.stdout.write(colors.error('[ERROR]') + ' Deleting ' + filename + '.' + config.autoConvertType + '\n' + colors.time('[' + common.getDateTime() + '] '));
       } else {
-        // suppose here we should forcefully remove the model from modelsCurrentlyCapturing
-        // because her captureProcess is unset, but let's leave this as is
+        common.errMsg(null, 'Deleting ' + filename + '.' + config.autoConvertType);
       }
-    })
-    .catch(function(err) {
-      if (err.code == 'ENOENT') {
-        // do nothing, file does not exists,
-        // this is kind of impossible case, however, probably there should be some code to "clean up" the process
-      } else {
-        printErrorMsg('[' + colors.green(model.nm) + '] ' + err.toString());
-      }
-    });
+      fs.unlink(config.completeDirectory + '/' + filename + '.' + config.autoConvertType);
+    }
+    semaphore--; // release semaphore only when ffmpeg process has ended
+  });
+
+  myCompleteProcess.on('error', function(err) {
+    common.errMsg(null, err);
+  });
 }
 
-function mainLoop() {
-  printDebugMsg('Start searching for new models');
+function startCapture(site, spawnArgs, filename, model) {
+  var nm;
+  switch (site) {
+    case MFC: nm = model.nm; break;
+    case CB:  nm = model;    break;
+  }
 
-  Promise
-    .try(function() {
-      return getFileno();
-    })
-    .then(function(fileno) {
-      return getOnlineModels(fileno);
-    })
-    .then(function() {
-      return selectMyModels();
-    })
-    .then(function(myModels) {
-      return Promise.all(myModels.map(createCaptureProcess));
-    })
-    .then(function() {
-      return Promise.all(modelsCurrentlyCapturing.map(checkCaptureProcess));
-    })
-    .then(function() {
-      models = onlineModels;
-    })
-    .catch(function(err) {
-      printErrorMsg(err);
-    })
-    .finally(function() {
-      dumpModelsCurrentlyCapturing();
+  //common.dbgMsg(site, 'Launching ffmpeg ' + spawnArgs);
+  var captureProcess = childProcess.spawn('ffmpeg', spawnArgs);
 
-      printMsg('Done, will search for new models in ' + config.modelScanInterval + ' second(s).');
+  captureProcess.stdout.on('data', function(data) {
+    common.msg(site, data);
+  });
 
-      setTimeout(mainLoop, config.modelScanInterval * 1000);
+  captureProcess.stderr.on('data', function(data) {
+    common.msg(site, data);
+  });
+
+  captureProcess.on('error', function(err) {
+    common.dbgMsg(site, err);
+  });
+
+  captureProcess.on('close', function() {
+    if (tryingToExit) {
+      process.stdout.write(colors.site(common.getSiteName(site)) + ' ' + colors.model(nm) + ' capture interrupted\n' + colors.time('[' + common.getDateTime() + '] '));
+    } else {
+      common.msg(site, colors.model(nm) + ' stopped streaming');
+    }
+
+    fs.stat(config.captureDirectory + '/' + filename + '.ts', function(err, stats) {
+      if (err) {
+        if (err.code == 'ENOENT') {
+          if (tryingToExit) {
+            process.stdout.write(colors.site(common.getSiteName(site)) + ' ' + colors.error('[ERROR] ') + colors.model(nm) + ': ' + filename + '.ts not found in capturing directory, cannot convert to ' + config.autoConvertType);
+          } else {
+            common.errMsg(site, colors.model(nm) + ': ' + filename + '.ts not found in capturing directory, cannot convert to ' + config.autoConvertType);
+          }
+        } else {
+          if (tryingToExit) {
+            process.stdout.write(colors.site(common.getSiteName(site)) + ' ' + colors.error('[ERROR] ') + colors.model(nm) + ': ' +err.toString());
+          } else {
+            common.errMsg(site, colors.model(nm) + ': ' + err.toString());
+          }
+        }
+      } else if (stats.size === 0) {
+        fs.unlink(config.captureDirectory + '/' + filename + '.ts');
+      } else {
+        postProcess(filename);
+      }
     });
+
+    removeModelFromCapList(site, model);
+  });
+
+  if (!!captureProcess.pid) {
+    switch (site) {
+      case MFC: site.addModelToCapList(model.uid, filename, captureProcess.pid); break;
+      case CB:  site.addModelToCapList(model,     filename, captureProcess.pid); break;
+    }
+  }
 }
 
-var session = bhttp.session();
+function mainSiteLoop(site) {
+  common.dbgMsg(site, 'Start searching for new models');
 
-var models = new Array();
-var onlineModels = new Array();
-var modelsCurrentlyCapturing = new Array();
-
-var config = yaml.safeLoad(fs.readFileSync('config.yml', 'utf8'));
-
-config.port = config.port || 9080;
-config.minFileSizeMb = config.minFileSizeMb || 0;
-
-config.captureDirectory = path.resolve(config.captureDirectory);
-config.completeDirectory = path.resolve(config.completeDirectory);
+  Promise.try(function() {
+    return site.getOnlineModels();
+  })
+  .then(function(onlineModels) {
+    if (typeof onlineModels !== 'undefined') {
+      common.msg(site, onlineModels.length  + ' model(s) online');
+      return getModelsToCap(site, onlineModels);
+    } else {
+      return null;
+    }
+  })
+  .then(function(modelsToCap) {
+    if (modelsToCap !== null) {
+      if (modelsToCap.length > 0) {
+        common.dbgMsg(site, modelsToCap.length + ' model(s) to capture');
+        var caps = [];
+        for (var i = 0; i < modelsToCap.length; i++) {
+          var cap = site.setupCapture(modelsToCap[i], tryingToExit).then(function(jobs) {
+            for (var j = 0; j < jobs.length; j++) {
+              if (jobs[j].spawnArgs !== '') {
+                startCapture(site, jobs[j].spawnArgs, jobs[j].filename, jobs[j].model);
+              }
+            }
+          });
+          caps.push(cap);
+        }
+        return Promise.all(caps);
+      } else {
+        return;
+      }
+    } else {
+      return;
+    }
+  })
+  .catch(function(err) {
+    common.errMsg(site, err);
+  })
+  .finally(function() {
+    common.msg(site, 'Done, will search for new models in ' + config.modelScanInterval + ' second(s).');
+    setTimeout(function() { mainSiteLoop(site); }, config.modelScanInterval * 1000);
+  });
+}
 
 mkdirp(config.captureDirectory, function(err) {
   if (err) {
-    printErrorMsg(err);
+    common.errMsg(null, err);
     process.exit(1);
   }
 });
 
 mkdirp(config.completeDirectory, function(err) {
   if (err) {
-    printErrorMsg(err);
+    common.errMsg(null, err);
     process.exit(1);
   }
 });
 
-config.includeModels = Array.isArray(config.includeModels) ? config.includeModels : [];
-config.excludeModels = Array.isArray(config.excludeModels) ? config.excludeModels : [];
-config.deleteModels = Array.isArray(config.deleteModels) ? config.deleteModels : [];
-
-config.includeUids = Array.isArray(config.includeUids) ? config.includeUids : [];
-config.excludeUids = Array.isArray(config.excludeUids) ? config.excludeUids : [];
-config.deleteUids = Array.isArray(config.deleteUids) ? config.deleteUids : [];
-
-// convert the list of models to the new format
-var dirty = false;
-
-if (config.models.length > 0) {
-  config.models = config.models.map(function(m) {
-
-    if (typeof m === 'number') { // then this "simple" uid
-      m = {uid: m, include: 1};
-
-      dirty = true;
-    } else if (_.isUndefined(m.mode)) { // if there is no mode field this old version
-      m.mode = !m.excluded ? 1 : 0;
-      dirty = true;
+function tryExit() {
+  // SIGINT will get passed to any running ffmpeg captures.
+  // Must delay exiting until the capture and postProcess
+  // for all models have finished.  Keep checking every 1s
+  var capsInProgress = 0;
+  for (var i = 0; i < SITES.length; i++) {
+    capsInProgress += SITES[i].getNumCapsInProgress();
+  }
+  if (semaphore === 0 && capsInProgress === 0) {
+    process.stdout.write('\n');
+    if (config.enableMFC) {
+      MFC.disconnect();
     }
+    process.exit(0);
+  } else {
+    sleep(1000).then(() => {
+      tryExit(); // recursion!
+      // periodically print something so it is more obvious
+      // that the script is not hung while waiting on ffmpeg
+      process.stdout.write('.');
+    });
+  }
+}
 
-    return m;
+process.on('SIGINT', function() {
+  // Prevent bad things from happening if user holds down ctrl+c
+  if (!tryingToExit) {
+    tryingToExit = 1;
+    var capsInProgress = 0;
+    for (var i = 0; i < SITES.length; i++) {
+      capsInProgress += SITES[i].getNumCapsInProgress();
+    }
+    if (semaphore > 0 || capsInProgress > 0) {
+      // extra newline to avoid ^C
+      process.stdout.write('\n');
+      common.msg(null, 'Waiting for ' + capsInProgress + ' capture stream(s) to end.');
+      process.stdout.write(colors.time('[' + common.getDateTime() + '] ')); // log beautification
+    }
+    tryExit();
+  }
+});
+
+if (config.enableMFC) {
+  MFC.create(MFC);
+  Promise.try(function() {
+    return MFC.connect();
+  }).then(function() {
+    mainSiteLoop(MFC);
+  }).catch(function(err) {
+    common.errMsg(MFC, err);
   });
 }
 
-if (dirty) { // then there were some changes in the list of models
-  printDebugMsg('Save changes in config.yml');
-
-  fs.writeFileSync('config.yml', yaml.safeDump(config), 0, 'utf8');
-
-  dirty = false;
+if (config.enableCB) {
+  CB.create(CB);
+  mainSiteLoop(CB);
 }
 
-mainLoop();
-
-dispatcher.onGet('/', function(req, res) {
-  fs.readFile('./index.html', function(err, data) {
-    if (err) {
-      res.writeHead(404, {'Content-Type': 'text/html'});
-      res.end('Not Found');
-    } else {
-      res.writeHead(200, {'Content-Type': 'text/html'});
-      res.end(data, 'utf-8');
-    }
-  });
-});
-
-// return an array of online models
-dispatcher.onGet('/models', function(req, res) {
-  res.writeHead(200, {'Content-Type': 'application/json'});
-  res.end(JSON.stringify(models));
-});
-
-// when we include the model we only "express our intention" to do so,
-// in fact the model will be included in the config only with the next iteration of mainLoop
-dispatcher.onGet('/models/include', function(req, res) {
-  if (req.params && req.params.uid) {
-    var uid = parseInt(req.params.uid, 10);
-
-    if (!isNaN(uid)) {
-      printDebugMsg(colors.green(uid) + ' to include');
-
-      // before we include the model we check that the model is not in our "to exclude" or "to delete" lists
-      remove(req.params.nm, config.excludeUids);
-      remove(req.params.nm, config.deleteUids);
-
-      config.includeUids.push(uid);
-
-      res.writeHead(200, {'Content-Type': 'application/json'});
-      res.end(JSON.stringify({uid: uid})); // this will be sent back to the browser
-
-      var model = _.findWhere(models, {uid: uid});
-
-      if (!_.isUndefined(model)) {
-        model.nextMode = 1;
-      }
-
-      return;
-    }
-  } else if (req.params && req.params.nm) {
-    printDebugMsg(colors.green(req.params.nm) + ' to include');
-
-    // before we include the model we check that the model is not in our "to exclude" or "to delete" lists
-    remove(req.params.nm, config.excludeModels);
-    remove(req.params.nm, config.deleteModels);
-
-    config.includeModels.push(req.params.nm);
-
-    dirty = true;
-
-    res.writeHead(200, {'Content-Type': 'application/json'});
-    res.end(JSON.stringify({nm: req.params.nm})); // this will be sent back to the browser
-
-    var model = _.findWhere(models, {nm: req.params.nm});
-
-    if (!_.isUndefined(model)) {
-      model.nextMode = 1;
-    }
-
-    return;
-  }
-
-  res.writeHead(422, {'Content-Type': 'application/json'});
-  res.end(JSON.stringify({error: 'Invalid request'}));
-});
-
-// whenever we exclude the model we only "express our intention" to do so,
-// in fact the model will be exclude from config only with the next iteration of mainLoop
-dispatcher.onGet('/models/exclude', function(req, res) {
-  if (req.params && req.params.uid) {
-    var uid = parseInt(req.params.uid, 10);
-
-    if (!isNaN(uid)) {
-      printDebugMsg(colors.green(uid) + ' to exclude');
-
-      // before we exclude the model we check that the model is not in our "to include" or "to delete" lists
-      remove(req.params.nm, config.includeUids);
-      remove(req.params.nm, config.deleteUids);
-
-      config.excludeUids.push(uid);
-
-      res.writeHead(200, {'Content-Type': 'application/json'});
-      res.end(JSON.stringify({uid: uid})); // this will be sent back to the browser
-
-      var model = _.findWhere(models, {uid: uid});
-
-      if (!_.isUndefined(model)) {
-        model.nextMode = 0;
-      }
-
-      return;
-    }
-  } else if (req.params && req.params.nm) {
-    printDebugMsg(colors.green(req.params.nm) + ' to exclude');
-
-    // before we exclude the model we check that the model is not in our "to include" or "to delete" lists
-    remove(req.params.nm, config.includeModels);
-    remove(req.params.nm, config.deleteModels);
-
-    config.excludeModels.push(req.params.nm);
-
-    dirty = true;
-
-    res.writeHead(200, {'Content-Type': 'application/json'});
-    res.end(JSON.stringify({nm: req.params.nm})); // this will be sent back to the browser
-
-    var model = _.findWhere(models, {nm: req.params.nm});
-
-    if (!_.isUndefined(model)) {
-      model.nextMode = 0;
-    }
-
-    return;
-  }
-
-  res.writeHead(422, {'Content-Type': 'application/json'});
-  res.end(JSON.stringify({error: 'Invalid request'}));
-});
-
-// whenever we delete the model we only "express our intention" to do so,
-// in fact the model will be markd as "deleted" in config only with the next iteration of mainLoop
-dispatcher.onGet('/models/delete', function(req, res) {
-  if (req.params && req.params.uid) {
-    var uid = parseInt(req.params.uid, 10);
-
-    if (!isNaN(uid)) {
-      printDebugMsg(colors.green(uid) + ' to delete');
-
-      // before we exclude the model we check that the model is not in our "to include" or "to exclude" lists
-      remove(req.params.nm, config.includeUids);
-      remove(req.params.nm, config.excludeUids);
-
-      config.deleteUids.push(uid);
-
-      res.writeHead(200, {'Content-Type': 'application/json'});
-      res.end(JSON.stringify({uid: uid})); // this will be sent back to the browser
-
-      var model = _.findWhere(models, {uid: uid});
-
-      if (!_.isUndefined(model)) {
-        model.nextMode = -1;
-      }
-
-      return;
-    }
-  } else if (req.params && req.params.nm) {
-    printDebugMsg(colors.green(req.params.nm) + ' to delete');
-
-    // before we exclude the model we check that the model is not in our "to include" or "to exclude" lists
-    remove(req.params.nm, config.includeModels);
-    remove(req.params.nm, config.excludeModels);
-
-    config.deleteModels.push(req.params.nm);
-
-    dirty = true;
-
-    res.writeHead(200, {'Content-Type': 'application/json'});
-    res.end(JSON.stringify({nm: req.params.nm})); // this will be sent back to the browser
-
-    var model = _.findWhere(models, {nm: req.params.nm});
-
-    if (!_.isUndefined(model)) {
-      model.nextMode = -1;
-    }
-
-    return;
-  }
-
-  res.writeHead(422, {'Content-Type': 'application/json'});
-  res.end(JSON.stringify({error: 'Invalid request'}));
-});
-
-dispatcher.onError(function(req, res) {
-  res.writeHead(404);
-});
-
-http.createServer(function(req, res) {
-  dispatcher.dispatch(req, res);
-}).listen(config.port, function() {
-  printMsg('Server listening on: ' + colors.green('0.0.0.0:' + config.port));
-});
