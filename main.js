@@ -15,22 +15,24 @@ var path = require('path');
 var HttpDispatcher = require('httpdispatcher');
 var http = require('http');
 var dispatcher = new HttpDispatcher();
+var xchat_servers = ["xchat22", "xchat23", "xchat24", "xchat25", "xchat26", "xchat27", "xchat30", "xchat31", "xchat32", "xchat33", "xchat34", "xchat35", "xchat36", "xchat39", "xchat40", "xchat41", "xchat42", "xchat43", "xchat44", "xchat45", "xchat46", "xchat47", "xchat48", "xchat49", "xchat58", "xchat59", "xchat60", "xchat61", "xchat62", "xchat63", "xchat64", "xchat65", "xchat66", "xchat67", "xchat69", "xchat70", "xchat71", "xchat72", "xchat73", "xchat74", "xchat75", "xchat90", "xchat92", "xchat93", "xchat94", "ychat30", "ychat31", "ychat32", "ychat33"];
+var xchat_server = xchat_servers[0];
 
 function getCurrentDateTime() {
   return moment().format('YYYY-MM-DD_HH-mm-ss'); // The only true way of writing out dates and times, ISO 8601
 };
 
 function printMsg(msg) {
-  console.log(colors.blue('[' + getCurrentDateTime() + ']'), msg);
+  console.log(colors.cyan('[' + getCurrentDateTime() + ']'), msg);
 }
 
 function printErrorMsg(msg) {
-  console.log(colors.blue('[' + getCurrentDateTime() + ']'), colors.red('[ERROR]'), msg);
+  console.log(colors.cyan('[' + getCurrentDateTime() + ']'), colors.red('[ERROR]'), msg);
 }
 
 function printDebugMsg(msg) {
   if (config.debug && msg) {
-    console.log(colors.blue('[' + getCurrentDateTime() + ']'), colors.yellow('[DEBUG]'), msg);
+    console.log(colors.cyan('[' + getCurrentDateTime() + ']'), colors.yellow('[DEBUG]'), msg);
   }
 }
 
@@ -95,8 +97,7 @@ function getFileno() {
 
           if (parts && parts[1] && parts[2] && parts[3] && parts[4]) {
             var a = `respkey=${parts[2]}&type=${parts[4]}&opts=${parts[1]}&serv=${parts[3]}&`;
-            printDebugMsg(a);
-
+            //printDebugMsg(a);
             connection.close();
             resolve(a);
           }
@@ -107,7 +108,10 @@ function getFileno() {
       connection.sendUTF("1 0 0 20071025 0 guest:guest\n\0");
     });
 
-    client.connect('ws://xchat20.myfreecams.com:8080/fcsl', '', 'http://xchat20.myfreecams.com:8080', {Cookie: 'company_id=3149; guest_welcome=1; history=7411522,5375294'});
+    //client.connect('ws://xchat20.myfreecams.com:8080/fcsl', '', 'http://xchat20.myfreecams.com:8080', {Cookie: 'company_id=3149; guest_welcome=1; history=7411522,5375294'});
+    printDebugMsg("Try connect to " + xchat_server);
+    client.connect(`ws://${xchat_server}.myfreecams.com:8080/fcsl`, '', `http://${xchat_server}.myfreecams.com:8080`, {Cookie: 'company_id=3149; guest_welcome=1; history=7411522,5375294'});
+
   }).timeout(30000); // 30 secs
 }
 
@@ -282,10 +286,16 @@ function createCaptureProcess(model) {
         '-v',
         'fatal',
         '-i',
-        'http://video' + (model.u.camserv - 500) + '.myfreecams.com:1935/NxServer/ngrp:mfc_' + (100000000 + model.uid) + '.f4v_mobile/playlist.m3u8?nc=1423603882490',
+        'http://video' + (model.u.camserv - 500) + '.myfreecams.com:1935/NxServer/ngrp:mfc_' + (100000000 + model.uid) + '.f4v_mobile/playlist.m3u8',
         // 'http://video' + (model.u.camserv - 500) + '.myfreecams.com:1935/NxServer/mfc_' + (100000000 + model.uid) + '.f4v_aac/playlist.m3u8?nc=1423603882490',
         '-c',
         'copy',
+        '-vsync',
+        '2',
+        '-r',
+        '60',
+        '-b:v',
+        '500k',
         config.captureDirectory + '/' + filename
       ];
 
@@ -410,6 +420,8 @@ function checkCaptureProcess(model) {
 }
 
 function mainLoop() {
+  let isTimeoutError = false;
+  
   printDebugMsg('Start searching for new models');
 
   Promise
@@ -433,13 +445,16 @@ function mainLoop() {
     })
     .catch(function(err) {
       printErrorMsg(err);
+      if (isTimeoutError = (err.name == "TimeoutError")) {
+        xchat_server = _.sample(xchat_servers); // pick a random xchat server
+      }
     })
     .finally(function() {
       dumpModelsCurrentlyCapturing();
 
       printMsg('Done, will search for new models in ' + config.modelScanInterval + ' second(s).');
-
-      setTimeout(mainLoop, config.modelScanInterval * 1000);
+      
+      setTimeout(mainLoop, isTimeoutError ? 3000: config.modelScanInterval * 1000); // try new server after 3 sec 
     });
 }
 
