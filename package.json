@@ -24,9 +24,10 @@
 		"moment": "^2.10.3",
 		"string": "^3.1.1",
 		"underscore": "^1.8.3",
-		"websocket": "^1.0.23",
+		"MFCAuto": "ZombieAlex/MFCAuto",
 		"colors": "^1.1.2",
 		"httpdispatcher": "^2.0.0",
-		"mv": "^2.1.1"
+		"mv": "^2.1.1",
+		"promise-queue": "^2.2.3"
 	}
 }
