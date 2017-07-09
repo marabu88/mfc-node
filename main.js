@@ -47,6 +47,9 @@ function mkdir(dir) {
   });
 }
 
+mkdir(captureDirectory);
+mkdir(completeDirectory);
+
 function getCurrentDateTime() {
   return moment().format('YYYY/MM/DD - HH:mm:ss'); // The only true way of writing out dates and times, ISO 8601
 }
@@ -403,7 +406,6 @@ function mainLoop() {
     })
     .finally(() => {
       printMsg('Done, will search for new models in ' + config.modelScanInterval + ' second(s).');
-
       setTimeout(mainLoop, config.modelScanInterval * 1000);
     });
 }
@@ -413,15 +415,8 @@ var mfcClient = new mfc.Client();
 Promise
   .try(() => mfcClient.connectAndWaitForModels())
   .timeout(120000) // 2 mins
-  .then(() => {
-    mkdir(captureDirectory);
-    mkdir(completeDirectory);
-
-    mainLoop();
-  })
-  .catch(err => {
-    printErrorMsg(err.toString());
-  });
+  .then(() => mainLoop())
+  .catch(err => printErrorMsg(err.toString()));
 
 dispatcher.onGet('/', (req, res) => {
   fs.readFile('./index.html', (err, data) => {
