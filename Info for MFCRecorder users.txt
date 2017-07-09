@@ -5,14 +5,17 @@ How export your model-list.
 
 Copy from Settings.xml part <ModelsInclude>...</ModelsInclude> to config.yml like this:
 
-includeUids:
-    <long>16780615</long>
-    <long>19545438</long>
-    <long>66066111</long>
+models:
+    <long>16780123</long>
+    <long>19545456</long>
+    <long>66066789</long>
 
-And replace with any text editor "<long>" => "- " and "</long>" => "" (without quiotes) like this:
+And replace with any text editor "<long>" => "- uid: " and "</long>" => \n+" mode: 1" (without quiotes; \n - new string) like this:
 
-includeUids:
-    - 16780615
-    - 19545438
-    - 66066111
+models:
+  - uid: 16780123
+    mode: 1
+  - uid: 19545456
+    mode: 1
+  - uid: 66066789
+    mode: 1
