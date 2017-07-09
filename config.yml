@@ -5,9 +5,4 @@ minFileSizeMb: 10
 port: 9080
 debug: false
 models: []
-includeModels: []
-includeUids: []
-excludeModels: []
-excludeUids: []
-deleteModels: []
-deleteUids: []
+queue: []
